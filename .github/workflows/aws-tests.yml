@@ -1,7 +1,7 @@
 name: AWS
 
 on:
-  push: { branches: [aws, remote-builder/refactor] }
+  push: { branches: [main, aws, remote-builder/unified-providers] }
 
 env:
   AWS_REGION: 'eu-west-1'

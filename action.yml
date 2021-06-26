@@ -47,11 +47,11 @@ inputs:
     required: false
     description: 'Supply a Persistent Volume Claim name to use for the Unity build.'
   remoteBuildMemory:
-    default: '800M'
+    default: '750M'
     required: false
     description: 'Amount of memory to assign the remote build container'
   remoteBuildCpu:
-    default: '0.25'
+    default: '1.0'
     required: false
     description: 'Amount of CPU time to assign the remote build container'
   kubeVolumeSize:

@@ -110,11 +110,11 @@ class Input {
   }
 
   static get remoteBuildMemory() {
-    return core.getInput('remoteBuildMemory') || '800M';
+    return core.getInput('remoteBuildMemory') || '750M';
   }
 
   static get remoteBuildCpu() {
-    return core.getInput('remoteBuildCpu') || '0.25';
+    return core.getInput('remoteBuildCpu') || '1.0';
   }
 
   static get kubeVolumeSize() {

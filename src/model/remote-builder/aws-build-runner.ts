@@ -11,6 +11,7 @@ class AWSBuildRunner {
     CF: AWS.CloudFormation,
     environment: RemoteBuilderEnvironmentVariable[],
     buildUid: string,
+    commands: string[],
   ) {
     const cluster = taskDef.baseResources?.find((x) => x.LogicalResourceId === 'ECSCluster')?.PhysicalResourceId || '';
     const taskDefinition =
@@ -33,6 +34,7 @@ class AWSBuildRunner {
           {
             name: taskDef.taskDefStackName,
             environment: [...environment, { name: 'BUILDID', value: buildUid }],
+            command: ['-c', ...commands],
           },
         ],
       },

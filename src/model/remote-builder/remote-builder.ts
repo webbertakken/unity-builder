@@ -1,48 +1,82 @@
-import { customAlphabet } from 'nanoid';
 import AWSBuildPlatform from './aws-build-platform';
 import * as core from '@actions/core';
-import RemoteBuilderConstants from './remote-builder-constants';
 import { BuildParameters } from '..';
-const repositoryDirectoryName = 'repo';
-const efsDirectoryName = 'data';
-const cacheDirectoryName = 'cache';
+import RemoteBuilderNamespace from './remote-builder-namespace';
+import RemoteBuilderSecret from './remote-builder-secret';
+import { RemoteBuilderProviderInterface } from './remote-builder-provider-interface';
+import Kubernetes from './kubernetes-build-platform';
+const repositoryFolder = 'repo';
+const buildVolumeFolder = 'data';
+const cacheFolder = 'cache';
 
 class RemoteBuilder {
   static SteamDeploy: boolean = false;
+  static RemoteBuilderProviderPlatform: RemoteBuilderProviderInterface;
   static async build(buildParameters: BuildParameters, baseImage) {
+    const runNumber = process.env.GITHUB_RUN_NUMBER;
+    if (!runNumber || runNumber === '') {
+      throw new Error('no run number found, exiting');
+    }
+    const buildUid = RemoteBuilderNamespace.generateBuildName(runNumber, buildParameters.platform);
+    const defaultBranchName =
+      process.env.GITHUB_REF?.split('/')
+        .filter((x) => {
+          x = x[0].toUpperCase() + x.slice(1);
+          return x;
+        })
+        .join('') || '';
+    const branchName =
+      process.env.REMOTE_BUILDER_CACHE !== undefined ? process.env.REMOTE_BUILDER_CACHE : defaultBranchName;
+    this.SteamDeploy = process.env.STEAM_DEPLOY !== undefined || false;
+    const token: string = buildParameters.githubToken;
+    const defaultSecretsArray = [
+      {
+        ParameterKey: 'GithubToken',
+        EnvironmentVariable: 'GITHUB_TOKEN',
+        ParameterValue: token,
+      },
+    ];
     try {
-      this.SteamDeploy = process.env.STEAM_DEPLOY !== undefined || false;
-      const nanoid = customAlphabet(RemoteBuilderConstants.alphabet, 4);
-      const buildUid = `${process.env.GITHUB_RUN_NUMBER}-${buildParameters.platform
-        .replace('Standalone', '')
-        .replace('standalone', '')}-${nanoid()}`;
-      const defaultBranchName =
-        process.env.GITHUB_REF?.split('/')
-          .filter((x) => {
-            x = x[0].toUpperCase() + x.slice(1);
-            return x;
-          })
-          .join('') || '';
-      const branchName =
-        process.env.REMOTE_BUILDER_CACHE !== undefined ? process.env.REMOTE_BUILDER_CACHE : defaultBranchName;
-      const token: string = buildParameters.githubToken;
-      const defaultSecretsArray = [
-        {
-          ParameterKey: 'GithubToken',
-          EnvironmentVariable: 'GITHUB_TOKEN',
-          ParameterValue: token,
-        },
-      ];
-      await RemoteBuilder.SetupStep(buildUid, buildParameters, branchName, defaultSecretsArray);
-      await RemoteBuilder.BuildStep(buildUid, buildParameters, baseImage, defaultSecretsArray);
-      await RemoteBuilder.CompressionStep(buildUid, buildParameters, branchName, defaultSecretsArray);
-      await RemoteBuilder.UploadArtifacts(buildUid, buildParameters, branchName, defaultSecretsArray);
+      switch (buildParameters.remoteBuildCluster) {
+        case 'aws':
+          core.info('Building with AWS');
+          this.RemoteBuilderProviderPlatform = new AWSBuildPlatform(buildParameters);
+          break;
+        default:
+        case 'k8s':
+          core.info('Building with Kubernetes');
+          this.RemoteBuilderProviderPlatform = new Kubernetes(buildParameters);
+          break;
+      }
+      await this.RemoteBuilderProviderPlatform.setupSharedBuildResources(
+        buildUid,
+        buildParameters,
+        branchName,
+        defaultSecretsArray,
+      );
+      await RemoteBuilder.SetupStep(`setup${buildUid}`, buildParameters, branchName, defaultSecretsArray);
+      await RemoteBuilder.BuildStep(`build${buildUid}`, buildParameters, baseImage, defaultSecretsArray);
+      await RemoteBuilder.CompressionStep(`compress${buildUid}`, buildParameters, branchName, defaultSecretsArray);
+      await RemoteBuilder.UploadArtifacts(`upload${buildUid}`, buildParameters, branchName, defaultSecretsArray);
       if (this.SteamDeploy) {
         await RemoteBuilder.DeployToSteam(buildUid, buildParameters, defaultSecretsArray);
       }
+      await this.RemoteBuilderProviderPlatform.cleanupSharedBuildResources(
+        buildUid,
+        buildParameters,
+        branchName,
+        defaultSecretsArray,
+      );
     } catch (error) {
-      core.setFailed(error);
-      core.error(error);
+      core.error(JSON.stringify(error, undefined, 4));
+      core.setFailed('Remote Builder failed');
+      await this.RemoteBuilderProviderPlatform.cleanupSharedBuildResources(
+        buildUid,
+        buildParameters,
+        branchName,
+        defaultSecretsArray,
+      );
+      throw error;
     }
   }
 
@@ -50,33 +84,36 @@ class RemoteBuilder {
     buildUid: string,
     buildParameters: BuildParameters,
     branchName: string | undefined,
-    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+    defaultSecretsArray: RemoteBuilderSecret[],
   ) {
     core.info('Starting step 1/4 clone and restore cache)');
-    await AWSBuildPlatform.runBuild(
+    await this.RemoteBuilderProviderPlatform.runBuildTask(
       buildUid,
-      buildParameters.awsStackName,
       'alpine/git',
       [
-        '-c',
         `apk update;
           apk add unzip;
           apk add git-lfs;
           apk add jq;
+
           # Get source repo for project to be built and game-ci repo for utilties
+
           git clone https://${buildParameters.githubToken}@github.com/${
           process.env.GITHUB_REPOSITORY
-        }.git ${buildUid}/${repositoryDirectoryName} -q
-          git clone https://${buildParameters.githubToken}@github.com/game-ci/unity-builder.git ${buildUid}/builder -q
-          git clone https://${buildParameters.githubToken}@github.com/game-ci/steam-deploy.git ${buildUid}/steam -q
-          cd /${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/
+        }.git ${buildUid}/${repositoryFolder}
+          cd ${buildUid}/${repositoryFolder}/
+          git lfs ls-files -l | cut -d' ' -f1 | sort > .assets-id
+          cd ../../
+          git clone https://${buildParameters.githubToken}@github.com/game-ci/unity-builder.git ${buildUid}/builder
+          git clone https://${buildParameters.githubToken}@github.com/game-ci/steam-deploy.git ${buildUid}/steam
+          cd /${buildVolumeFolder}/${buildUid}/${repositoryFolder}/
           git checkout $GITHUB_SHA
-          cd /${efsDirectoryName}/
+          cd /${buildVolumeFolder}/
           # Look for usable cache
-          if [ ! -d ${cacheDirectoryName} ]; then
-            mkdir ${cacheDirectoryName}
+          if [ ! -d ${cacheFolder} ]; then
+            mkdir ${cacheFolder}
           fi
-          cd ${cacheDirectoryName}
+          cd ${cacheFolder}
           if [ ! -d "${branchName}" ]; then
             mkdir "${branchName}"
           fi
@@ -85,8 +122,8 @@ class RemoteBuilder {
           echo "Cached Libraries for ${branchName} from previous builds:"
           ls
           echo ''
-          ls "/${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/${buildParameters.projectPath}"
-          libDir="/${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/${buildParameters.projectPath}/Library"
+          ls "/${buildVolumeFolder}/${buildUid}/${repositoryFolder}/${buildParameters.projectPath}"
+          libDir="/${buildVolumeFolder}/${buildUid}/${repositoryFolder}/${buildParameters.projectPath}/Library"
           if [ -d "$libDir" ]; then
             rm -r "$libDir"
             echo "Setup .gitignore to ignore Library folder and remove it from builds"
@@ -107,18 +144,18 @@ class RemoteBuilder {
           # Print out important directories
           echo ''
           echo 'Repo:'
-          ls /${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/
+          ls /${buildVolumeFolder}/${buildUid}/${repositoryFolder}/
           echo ''
           echo 'Project:'
-          ls /${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/${buildParameters.projectPath}
+          ls /${buildVolumeFolder}/${buildUid}/${repositoryFolder}/${buildParameters.projectPath}
           echo ''
           echo 'Library:'
-          ls /${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/${buildParameters.projectPath}/Library/
+          ls /${buildVolumeFolder}/${buildUid}/${repositoryFolder}/${buildParameters.projectPath}/Library/
           echo ''
       `,
       ],
-      `/${efsDirectoryName}`,
-      `/${efsDirectoryName}/`,
+      `/${buildVolumeFolder}`,
+      `/${buildVolumeFolder}/`,
       [
         {
           name: 'GITHUB_SHA',
@@ -133,7 +170,7 @@ class RemoteBuilder {
     buildUid: string,
     buildParameters: BuildParameters,
     baseImage: any,
-    defaultSecretsArray: any[],
+    defaultSecretsArray: RemoteBuilderSecret[],
   ) {
     const buildSecrets = new Array();
 
@@ -188,23 +225,21 @@ class RemoteBuilder {
         ParameterValue: buildParameters.androidKeyaliasPass,
       });
     core.info('Starting part 2/4 (build unity project)');
-    await AWSBuildPlatform.runBuild(
+    await this.RemoteBuilderProviderPlatform.runBuildTask(
       buildUid,
-      buildParameters.awsStackName,
       baseImage.toString(),
       [
-        '-c',
         `
-            cp -r /${efsDirectoryName}/${buildUid}/builder/dist/default-build-script/ /UnityBuilderAction;
-            cp -r /${efsDirectoryName}/${buildUid}/builder/dist/entrypoint.sh /entrypoint.sh;
-            cp -r /${efsDirectoryName}/${buildUid}/builder/dist/steps/ /steps;
+            cp -r /${buildVolumeFolder}/${buildUid}/builder/dist/default-build-script/ /UnityBuilderAction;
+            cp -r /${buildVolumeFolder}/${buildUid}/builder/dist/entrypoint.sh /entrypoint.sh;
+            cp -r /${buildVolumeFolder}/${buildUid}/builder/dist/steps/ /steps;
             chmod -R +x /entrypoint.sh;
             chmod -R +x /steps;
             /entrypoint.sh;
           `,
       ],
-      `/${efsDirectoryName}`,
-      `/${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/`,
+      `/${buildVolumeFolder}`,
+      `/${buildVolumeFolder}/${buildUid}/${repositoryFolder}/`,
       [
         {
           name: 'ContainerMemory',
@@ -216,7 +251,7 @@ class RemoteBuilder {
         },
         {
           name: 'GITHUB_WORKSPACE',
-          value: `/${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/`,
+          value: `/${buildVolumeFolder}/${buildUid}/${repositoryFolder}/`,
         },
         {
           name: 'PROJECT_PATH',
@@ -267,29 +302,30 @@ class RemoteBuilder {
     buildUid: string,
     buildParameters: BuildParameters,
     branchName: string | undefined,
-    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+    defaultSecretsArray: RemoteBuilderSecret[],
   ) {
     core.info('Starting step 3/4 build compression');
     // Cleanup
-    await AWSBuildPlatform.runBuild(
+    await this.RemoteBuilderProviderPlatform.runBuildTask(
       buildUid,
-      buildParameters.awsStackName,
       'alpine',
       [
-        '-c',
         `
             apk update
             apk add zip
             cd Library
             zip -r lib-${buildUid}.zip .*
-            mv lib-${buildUid}.zip /${efsDirectoryName}/${cacheDirectoryName}/${branchName}/lib-${buildUid}.zip
+            mv lib-${buildUid}.zip /${buildVolumeFolder}/${cacheFolder}/${branchName}/lib-${buildUid}.zip
             cd ../../
+            ls
+            echo ' '
+            ls ${buildParameters.buildPath}
             zip -r build-${buildUid}.zip ${buildParameters.buildPath}/*
-            mv build-${buildUid}.zip /${efsDirectoryName}/${buildUid}/build-${buildUid}.zip
+            mv build-${buildUid}.zip /${buildVolumeFolder}/${buildUid}/build-${buildUid}.zip
           `,
       ],
-      `/${efsDirectoryName}`,
-      `/${efsDirectoryName}/${buildUid}/${repositoryDirectoryName}/${buildParameters.projectPath}`,
+      `/${buildVolumeFolder}`,
+      `/${buildVolumeFolder}/${buildUid}/${repositoryFolder}/${buildParameters.projectPath}`,
       [
         {
           name: 'GITHUB_SHA',
@@ -305,24 +341,22 @@ class RemoteBuilder {
     buildUid: string,
     buildParameters: BuildParameters,
     branchName: string | undefined,
-    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+    defaultSecretsArray: RemoteBuilderSecret[],
   ) {
     core.info('Starting step 4/4 upload build to s3');
-    await AWSBuildPlatform.runBuild(
+    await this.RemoteBuilderProviderPlatform.runBuildTask(
       buildUid,
-      buildParameters.awsStackName,
       'amazon/aws-cli',
       [
-        '-c',
         `
             aws s3 cp ${buildUid}/build-${buildUid}.zip s3://game-ci-storage/
             # no need to upload Library cache for now
-            # aws s3 cp /${efsDirectoryName}/${cacheDirectoryName}/${branchName}/lib-${buildUid}.zip s3://game-ci-storage/
+            # aws s3 cp /${buildVolumeFolder}/${cacheFolder}/${branchName}/lib-${buildUid}.zip s3://game-ci-storage/
             ${this.SteamDeploy ? '#' : ''} rm -r ${buildUid}
           `,
       ],
-      `/${efsDirectoryName}`,
-      `/${efsDirectoryName}/`,
+      `/${buildVolumeFolder}`,
+      `/${buildVolumeFolder}/`,
       [
         {
           name: 'GITHUB_SHA',
@@ -352,28 +386,26 @@ class RemoteBuilder {
   private static async DeployToSteam(
     buildUid: string,
     buildParameters: BuildParameters,
-    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+    defaultSecretsArray: RemoteBuilderSecret[],
   ) {
     core.info('Starting steam deployment');
-    await AWSBuildPlatform.runBuild(
+    await this.RemoteBuilderProviderPlatform.runBuildTask(
       buildUid,
-      buildParameters.awsStackName,
       'cm2network/steamcmd:root',
       [
-        '-c',
         `
             ls
             ls /
-            cp -r /${efsDirectoryName}/${buildUid}/steam/action/entrypoint.sh /entrypoint.sh;
-            cp -r /${efsDirectoryName}/${buildUid}/steam/action/steps/ /steps;
+            cp -r /${buildVolumeFolder}/${buildUid}/steam/action/entrypoint.sh /entrypoint.sh;
+            cp -r /${buildVolumeFolder}/${buildUid}/steam/action/steps/ /steps;
             chmod -R +x /entrypoint.sh;
             chmod -R +x /steps;
             /entrypoint.sh;
-            rm -r /${efsDirectoryName}/${buildUid}
+            rm -r /${buildVolumeFolder}/${buildUid}
           `,
       ],
-      `/${efsDirectoryName}`,
-      `/${efsDirectoryName}/${buildUid}/steam/action/`,
+      `/${buildVolumeFolder}`,
+      `/${buildVolumeFolder}/${buildUid}/steam/action/`,
       [
         {
           name: 'GITHUB_SHA',
@@ -394,7 +426,7 @@ class RemoteBuilder {
         {
           EnvironmentVariable: 'INPUT_ROOTPATH',
           ParameterKey: 'rootPath',
-          ParameterValue: process.env.ROOT_PATH || '',
+          ParameterValue: buildParameters.buildPath,
         },
         {
           EnvironmentVariable: 'INPUT_RELEASEBRANCH',

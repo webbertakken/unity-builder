@@ -7,18 +7,45 @@ import * as core from '@actions/core';
 import RemoteBuilderTaskDef from './remote-builder-task-def';
 import RemoteBuilderConstants from './remote-builder-constants';
 import AWSBuildRunner from './aws-build-runner';
+import { RemoteBuilderProviderInterface } from './remote-builder-provider-interface';
+import BuildParameters from '../build-parameters';
 
-class AWSBuildEnvironment {
-  static async runBuild(
+class AWSBuildEnvironment implements RemoteBuilderProviderInterface {
+  private stackName: string;
+
+  constructor(buildParameters: BuildParameters) {
+    this.stackName = buildParameters.awsStackName;
+  }
+  cleanupSharedBuildResources(
+    // eslint-disable-next-line no-unused-vars
+    buildUid: string,
+    // eslint-disable-next-line no-unused-vars
+    buildParameters: BuildParameters,
+    // eslint-disable-next-line no-unused-vars
+    branchName: string,
+    // eslint-disable-next-line no-unused-vars
+    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+  ) {}
+  setupSharedBuildResources(
+    // eslint-disable-next-line no-unused-vars
+    buildUid: string,
+    // eslint-disable-next-line no-unused-vars
+    buildParameters: BuildParameters,
+    // eslint-disable-next-line no-unused-vars
+    branchName: string,
+    // eslint-disable-next-line no-unused-vars
+    defaultSecretsArray: { ParameterKey: string; EnvironmentVariable: string; ParameterValue: string }[],
+  ) {}
+
+  async runBuildTask(
     buildId: string,
-    stackName: string,
     image: string,
     commands: string[],
     mountdir: string,
     workingdir: string,
     environment: RemoteBuilderEnvironmentVariable[],
     secrets: RemoteBuilderSecret[],
-  ) {
+  ): Promise<void> {
     const ECS = new SDK.ECS();
     const CF = new SDK.CloudFormation();
     const entrypoint = ['/bin/sh'];
@@ -26,7 +53,6 @@ class AWSBuildEnvironment {
     const taskDef = await this.setupCloudFormations(
       CF,
       buildId,
-      stackName,
       image,
       entrypoint,
       commands,
@@ -35,17 +61,13 @@ class AWSBuildEnvironment {
       secrets,
     );
     try {
-      await AWSBuildRunner.runTask(taskDef, ECS, CF, environment, buildId);
+      await AWSBuildRunner.runTask(taskDef, ECS, CF, environment, buildId, commands);
     } finally {
       await this.cleanupResources(CF, taskDef);
     }
   }
 
-  // static async setupPlatformResources() {
-  //   throw new Error('Method not implemented.');
-  // }
-
-  static getParameterTemplate(p1) {
+  getParameterTemplate(p1) {
     return `
   ${p1}:
     Type: String
@@ -53,7 +75,7 @@ class AWSBuildEnvironment {
 `;
   }
 
-  static getSecretTemplate(p1) {
+  getSecretTemplate(p1) {
     return `
   ${p1}Secret:
     Type: AWS::SecretsManager::Secret
@@ -63,23 +85,22 @@ class AWSBuildEnvironment {
 `;
   }
 
-  static getSecretDefinitionTemplate(p1, p2) {
+  getSecretDefinitionTemplate(p1, p2) {
     return `
             - Name: '${p1}'
               ValueFrom: !Ref ${p2}Secret
 `;
   }
 
-  static insertAtTemplate(template, insertionKey, insertion) {
+  insertAtTemplate(template, insertionKey, insertion) {
     const index = template.search(insertionKey) + insertionKey.length + '\n'.length;
     template = [template.slice(0, index), insertion, template.slice(index)].join('');
     return template;
   }
 
-  static async setupCloudFormations(
+  async setupCloudFormations(
     CF: SDK.CloudFormation,
     buildUid: string,
-    stackName: string,
     image: string,
     entrypoint: string[],
     commands: string[],
@@ -91,7 +112,7 @@ class AWSBuildEnvironment {
     commands[1] += `
       echo "${logid}"
     `;
-    const taskDefStackName = `${stackName}-${buildUid}`;
+    const taskDefStackName = `${this.stackName}-${buildUid}`;
     let taskDefCloudFormation = this.readTaskCloudFormationTemplate();
     const cleanupTaskDefStackName = `${taskDefStackName}-cleanup`;
     const cleanupCloudFormation = fs.readFileSync(`${__dirname}/cloud-formations/cloudformation-stack-ttl.yml`, 'utf8');
@@ -132,7 +153,7 @@ class AWSBuildEnvironment {
           },
           {
             ParameterKey: 'Command',
-            ParameterValue: commands.join(','),
+            ParameterValue: 'echo "this template should be overwritten when running a task"',
           },
           {
             ParameterKey: 'EntryPoint',
@@ -181,7 +202,7 @@ class AWSBuildEnvironment {
 
       await CF.waitFor('stackCreateComplete', { StackName: taskDefStackName }).promise();
     } catch (error) {
-      await AWSBuildEnvironment.handleStackCreationFailure(error, CF, taskDefStackName, taskDefCloudFormation, secrets);
+      await this.handleStackCreationFailure(error, CF, taskDefStackName, taskDefCloudFormation, secrets);
 
       throw error;
     }
@@ -192,7 +213,7 @@ class AWSBuildEnvironment {
       }).promise()
     ).StackResources;
 
-    const baseResources = (await CF.describeStackResources({ StackName: stackName }).promise()).StackResources;
+    const baseResources = (await CF.describeStackResources({ StackName: this.stackName }).promise()).StackResources;
 
     // in the future we should offer a parameter to choose if you want the guarnteed shutdown.
     core.info('Worker cluster created successfully (skipping wait for cleanup cluster to be ready)');
@@ -208,7 +229,7 @@ class AWSBuildEnvironment {
     };
   }
 
-  private static async handleStackCreationFailure(
+  async handleStackCreationFailure(
     error: any,
     CF: SDK.CloudFormation,
     taskDefStackName: string,
@@ -224,11 +245,11 @@ class AWSBuildEnvironment {
     core.error(error);
   }
 
-  static readTaskCloudFormationTemplate(): string {
+  readTaskCloudFormationTemplate(): string {
     return fs.readFileSync(`${__dirname}/cloud-formations/task-def-formation.yml`, 'utf8');
   }
 
-  static async cleanupResources(CF: SDK.CloudFormation, taskDef: RemoteBuilderTaskDef) {
+  async cleanupResources(CF: SDK.CloudFormation, taskDef: RemoteBuilderTaskDef) {
     core.info('Cleanup starting');
     await CF.deleteStack({
       StackName: taskDef.taskDefStackName,
